@@ -1,0 +1,38 @@
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Logs and temporary files
+logs/*
+!logs/.gitkeep
+*.log
+*.bak
+*.backup
+*.voice-backup
+
+# ML model weights and engines
+*.pt
+*.pth
+*.onnx
+*.engine
+*.gguf
+*.tflite
+
+# Downloaded speech models
+vosk-model-*/
+*.zip
+
+# System files
+.DS_Store
+Thumbs.db

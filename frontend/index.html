@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge AI Assistant</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: #121a2b;
+  --border: #29354a;
+  --text: #edf3ff;
+  --muted: #9aa9c0;
+  --accent: #78a9ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, sans-serif;
+  display: flex;
+  justify-content: center;
+  padding: 24px;
+}
+.app { width: min(900px, 100%); display: flex; flex-direction: column; gap: 18px; }
+header, .status, .chat, .composer {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 16px;
+}
+header { padding: 22px; }
+h1 { font-size: clamp(24px, 4vw, 34px); margin: 0 0 6px; }
+p { margin: 0; }
+.subtitle, .hint { color: var(--muted); }
+.status { padding: 12px 16px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+#status { color: #8ee6b0; }
+.chat { padding: 18px; min-height: 350px; max-height: 55vh; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+.message { padding: 12px 15px; border-radius: 12px; max-width: 90%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.user { align-self: flex-end; background: #203d6c; }
+.assistant { align-self: flex-start; background: #1b2639; border: 1px solid var(--border); }
+.label { font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+.composer { padding: 12px; display: flex; gap: 10px; }
+textarea { flex: 1; resize: vertical; min-height: 48px; max-height: 160px; background: #0b1020; color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 12px; font: inherit; }
+button { border: 0; border-radius: 10px; padding: 12px 18px; background: var(--accent); color: #081326; font-weight: 700; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+.actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+#clear { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+.hint { font-size: 13px; }
+#voice-toggle { background: #24364f; color: var(--text); border: 1px solid #405675; }
+#voice-toggle.listening { background: #7d2935; color: white; border-color: #b94d5b; }
+#voice-status { min-height: 20px; }
+@media(max-width: 520px) {
+  #voice-toggle { width: 100%; }
+}
+@media(max-width: 520px) { body { padding: 12px; } .composer { flex-direction: column; } .composer button { width: 100%; } }
+</style>
+</head>
+<body>
+<main class="app">
+  <header>
+    <h1>Intelligent Edge AI Assistant</h1>
+    <p class="subtitle">YOLO11 live vision · Gemma 3 4B · NVIDIA Jetson Orin Nano</p>
+  </header>
+
+  <section class="status">
+    <span>Camera: <strong id="status">Checking…</strong></span>
+    <span id="scene-count">Detected objects: —</span>
+    <span id="fps">FPS: —</span>
+  </section>
+
+  <section id="chat" class="chat" aria-live="polite">
+    <div class="message assistant">
+      <div class="label">EDGE AI ASSISTANT</div>
+      Hey! Ask me a general question or ask about objects detected by my camera.
+    </div>
+  </section>
+
+  <form id="form" class="composer">
+    <textarea id="question" placeholder="Ask anything… e.g. What objects can you see?" required></textarea>
+    <button id="voice-toggle" type="button" aria-pressed="false">🎙 Start Voice</button>
+    <button id="send" type="submit">Send</button>
+  </form>
+
+  <div class="actions">
+    <span class="hint">
+      <span id="voice-status" role="status">Voice ready when supported by your browser.</span><br>
+      Press Enter to send · Shift + Enter for a new line
+    </span>
+    <button id="clear" type="button">Clear chat</button>
+  </div>
+</main>
+
+<script>
+const chat = document.getElementById("chat");
+const form = document.getElementById("form");
+const question = document.getElementById("question");
+const send = document.getElementById("send");
+
+const voiceToggle = document.getElementById("voice-toggle");
+const voiceStatus = document.getElementById("voice-status");
+
+let voiceSocket = null;
+let listening = false;
+let voiceSending = false;
+let silenceTimer = null;
+let finalTranscript = "";
+let interimTranscript = "";
+let voiceBaseText = "";
+let voiceEditedByUser = false;
+
+function setVoiceStatus(message) {
+  voiceStatus.textContent = message;
+}
+
+function clearSilenceTimer() {
+  if (silenceTimer) clearTimeout(silenceTimer);
+  silenceTimer = null;
+}
+
+function updateVoiceInput() {
+  if (voiceEditedByUser) return;
+  const transcript = [finalTranscript, interimTranscript]
+    .filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  question.value = [voiceBaseText, transcript]
+    .filter(Boolean).join(" ").trim();
+}
+
+function stopVoice(message = "Voice stopped.") {
+  listening = false;
+  clearSilenceTimer();
+  voiceToggle.classList.remove("listening");
+  voiceToggle.setAttribute("aria-pressed", "false");
+  voiceToggle.textContent = "🎙 Start Voice";
+
+  const socket = voiceSocket;
+  voiceSocket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+
+  setVoiceStatus(message);
+}
+
+function scheduleVoiceSend() {
+  clearSilenceTimer();
+  if (!finalTranscript.trim()) return;
+
+  silenceTimer = setTimeout(() => {
+    if (!listening || voiceSending || voiceEditedByUser) return;
+
+    const message = [voiceBaseText, finalTranscript]
+      .filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    if (!message) return;
+
+    voiceSending = true;
+    stopVoice("Sending your voice question…");
+    question.value = message;
+    form.requestSubmit();
+  }, 1800);
+}
+
+voiceToggle.addEventListener("click", () => {
+  if (listening) {
+    stopVoice();
+    return;
+  }
+
+  if (send.disabled || voiceSending) {
+    setVoiceStatus("Wait for the current answer to finish.");
+    return;
+  }
+
+  finalTranscript = "";
+  interimTranscript = "";
+  voiceEditedByUser = false;
+  voiceBaseText = question.value.trim();
+  clearSilenceTimer();
+
+  const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${wsProtocol}//${location.host}/ws/voice`);
+  voiceSocket = socket;
+  listening = true;
+  voiceToggle.classList.add("listening");
+  voiceToggle.setAttribute("aria-pressed", "true");
+  voiceToggle.textContent = "⏹ Stop Voice";
+  setVoiceStatus("Connecting to offline Vosk…");
+
+  socket.onopen = () => {
+    if (listening) setVoiceStatus("Connected. Speak your question…");
+  };
+
+  socket.onmessage = (event) => {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (_) {
+      return;
+    }
+
+    if (data.type === "error") {
+      stopVoice(`Voice error: ${data.text || "Unknown error"}`);
+      return;
+    }
+
+    if (data.type === "status") {
+      setVoiceStatus(data.text || "Listening…");
+      return;
+    }
+
+    if (data.type === "partial") {
+      interimTranscript = data.text || "";
+      updateVoiceInput();
+      clearSilenceTimer();
+      setVoiceStatus("Listening…");
+      return;
+    }
+
+    if (data.type === "final" && data.text) {
+      finalTranscript = [finalTranscript, data.text]
+        .filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+      interimTranscript = "";
+      updateVoiceInput();
+      setVoiceStatus("Speech recognized. Waiting for a pause…");
+      scheduleVoiceSend();
+    }
+  };
+
+  socket.onerror = () => {
+    if (listening) stopVoice("WebSocket connection failed. Check the backend.");
+  };
+
+  socket.onclose = () => {
+    if (listening) stopVoice("Voice connection closed. Tap Start Voice to retry.");
+  };
+});
+
+question.addEventListener("input", () => {
+  if (listening && document.activeElement === question) {
+    voiceEditedByUser = true;
+    clearSilenceTimer();
+    setVoiceStatus("Input edited manually. Stop and restart voice to resume auto-send.");
+  }
+});
+
+
+function addMessage(text, role, source = "") {
+  const wrapper = document.createElement("div");
+  wrapper.className = `message ${role}`;
+
+  const label = document.createElement("div");
+  label.className = "label";
+  label.textContent = role === "user" ? "YOU" : `EDGE AI ASSISTANT${source ? " · " + source : ""}`;
+
+  const content = document.createElement("div");
+  content.textContent = text;
+
+  wrapper.append(label, content);
+  chat.appendChild(wrapper);
+  chat.scrollTop = chat.scrollHeight;
+  return content;
+}
+
+async function refreshScene() {
+  try {
+    const response = await fetch("/scene");
+    if (!response.ok) throw new Error("Scene API unavailable");
+    const scene = await response.json();
+    document.getElementById("status").textContent = scene.status;
+    document.getElementById("scene-count").textContent =
+      `Detected objects: ${scene.object_count ?? 0}`;
+    document.getElementById("fps").textContent =
+      `FPS: ${typeof scene.fps === "number" ? scene.fps.toFixed(1) : "—"}`;
+    document.getElementById("status").style.color =
+      scene.status === "online" ? "#8ee6b0" : "#ffb4a9";
+  } catch {
+    document.getElementById("status").textContent = "Unavailable";
+    document.getElementById("status").style.color = "#ffb4a9";
+  }
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = question.value.trim();
+  if (!message || send.disabled) return;
+
+  addMessage(message, "user");
+  question.value = "";
+  send.disabled = true;
+  send.textContent = "Thinking…";
+  const pending = addMessage("Thinking…", "assistant");
+
+  try {
+    const response = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message })
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Request failed");
+    pending.textContent = data.response || "No answer returned.";
+    pending.previousElementSibling.textContent =
+      `EDGE AI ASSISTANT · ${data.answer_source || "LOCAL AI"}`;
+  } catch (error) {
+    pending.textContent = `Sorry, I couldn't get an answer: ${error.message}`;
+  } finally {
+    send.disabled = false;
+    send.textContent = "Send";
+    voiceSending = false;
+    if (!listening) setVoiceStatus("Ready.");
+    question.focus();
+    refreshScene();
+  }
+});
+
+question.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    form.requestSubmit();
+  }
+});
+
+document.getElementById("clear").addEventListener("click", () => {
+  chat.replaceChildren();
+  addMessage("Chat cleared. What would you like to ask?", "assistant");
+});
+
+refreshScene();
+setInterval(refreshScene, 2000);
+</script>
+</body>
+</html>
